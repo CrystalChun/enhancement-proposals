@@ -219,7 +219,42 @@ Starting state: A Cloud Provider Admin has created a ClusterTemplate named
 
 3. If the template exists, the request proceeds to the server handler. If
    not, the interceptor returns `InvalidArgument` with
-   `spec.template.name: ClusterTemplate "ocp-4.18" not found in tenant "infra-templates"`.
+   `spec.template.name: ClusterTemplate "ocp-4.18" not found in tenant "infra-templates"`
+   (private API — Cloud Provider Admin error messages include the target
+   tenant and project because the admin provided them explicitly).
+
+#### Access control model
+
+The three workflows above illustrate three distinct personas. The reference
+system enforces the following access boundaries:
+
+| Persona | API | Can specify tenant/project | Reference resolution scope | Error detail |
+|---|---|---|---|---|
+| **Cloud Provider Admin** | Private | Yes — explicit `tenant` and `project` fields | Any tenant, any project. Cross-tenant and cross-project lookups permitted. | Full: includes target tenant and project names. |
+| **Tenant Admin** | Public | No — uses `bool shared` for cross-tenant; no project override | Own tenant (or shared tenant via `shared = true`). Own project for project-scoped resources; project-first-then-tenant fallback for templates, catalog items, roles. | Scoped: resource name only, no tenant or project identifiers. |
+| **Tenant User** | Public | No — same as Tenant Admin | Same as Tenant Admin. | Scoped: resource name only, no tenant or project identifiers. |
+
+**Key constraints:**
+
+1. **Private APIs are restricted to Cloud Provider Admins.** Only Cloud
+   Provider Admins authenticate against the private API. Tenant Admins and
+   Tenant Users use the public API exclusively.
+
+2. **Tenant Admins and Tenant Users cannot see or specify other tenants or
+   projects.** The public API does not expose `tenant` or `project` fields.
+   Cross-tenant access is limited to the `shared` tenant via `bool shared`.
+   A Tenant User in project A cannot reference, resolve, or discover
+   resources in project B — the interceptor scopes all project-scoped
+   lookups to the caller's project, and errors reveal only the resource name
+   without disclosing scope information.
+
+3. **Project isolation is enforced by the interceptor.** For project-scoped
+   resources (VirtualNetwork, Subnet, SecurityGroup, ComputeInstance,
+   Cluster, BareMetalInstance, ExternalIP, PublicIP, and their attachments),
+   the interceptor's lookup function includes the caller's project as a
+   filter. A resource that exists in project B is invisible to a caller in
+   project A — the lookup returns not-found, identical to the resource not
+   existing at all.
 
 #### Error handling: invalid reference
 
@@ -234,7 +269,9 @@ When a user references a nonexistent resource:
 }
 ```
 
-The interceptor returns:
+The interceptor returns an error whose detail level depends on the API:
+
+Private API (Cloud Provider Admin):
 ```
 Code: InvalidArgument
 Message: invalid resource references
@@ -245,6 +282,27 @@ Details: [
   }
 ]
 ```
+
+Public API (Tenant Admin / Tenant User):
+```
+Code: InvalidArgument
+Message: invalid resource references
+Details: [
+  {
+    field: "spec.virtual_network.name",
+    description: "VirtualNetwork \"nonexistent-vnet\" not found"
+  }
+]
+```
+
+Public API error messages omit tenant and project identifiers. Including
+them would disclose scope information to users who should not see it —
+particularly in a failed cross-project lookup, where revealing "not found
+in project B" would confirm that project B exists. The interceptor formats
+error descriptions based on whether the request arrived via the public or
+private API (determined from the gRPC service path): private API errors
+include the full scope context because the admin provided those values
+explicitly; public API errors include only the resource type and name.
 
 The response uses `google.rpc.BadRequest` with `FieldViolation` entries for
 each invalid reference, providing a machine-parseable and human-readable error.
@@ -471,6 +529,29 @@ resource can be in a different tenant or project from the referencing resource:
 | `ProjectMembershipSpec.project` | `ProjectReference` | Cross-project by definition |
 | `ProjectMembershipSpec.user` | `UserReference` | Cross-project |
 
+#### Reference target scope classification
+
+Each referenceable resource type belongs to one of four scope levels. The
+scope determines how the interceptor filters lookups and which context
+(tenant, project) is required:
+
+| Scope level | Filtering | Resources | Lookup behavior |
+|---|---|---|---|
+| **Platform-scoped** | No tenant or project filter | NetworkClass, ExternalIPPool, PublicIPPool, HostType, InstanceType | Names are globally unique. Lookup functions omit tenant and project predicates. |
+| **Project-or-tenant** | Project first, then tenant | ClusterTemplate, ComputeInstanceTemplate, BareMetalInstanceTemplate, ClusterCatalogItem, ComputeInstanceCatalogItem, BareMetalInstanceCatalogItem, Role | **Project-first-then-tenant fallback:** the interceptor first looks up by name within the caller's project. If not found, it retries at the tenant level (empty project). A project-scoped instance shadows a tenant-scoped one with the same name. |
+| **Project-scoped** | Tenant and project filter | VirtualNetwork, Subnet, SecurityGroup, ComputeInstance, Cluster, BareMetalInstance, ExternalIP, PublicIP, ExternalIPAttachment, PublicIPAttachment, NATGateway | Names are unique within (tenant, project). Lookup functions filter by both tenant and project. All project-scoped targets use local references. |
+| **Cross-project** | Varies by operation | User, Project, ProjectMembership, RoleBinding | IAM resources that span project boundaries by design. Lookup functions use resource-specific scoping rules (e.g., users within a tenant, projects within a tenant). |
+
+Every project-scoped resource in the reference table above uses a
+`LocalReference`, so the interceptor always resolves them within the
+caller's own project. No full reference targets a project-scoped resource.
+Project-or-tenant and platform-scoped resources use full references
+(`Reference`) because they may be accessed from any project within the
+tenant (or across tenants via `shared`). This alignment between scope level
+and reference type is by design: the `bool shared` mechanism addresses
+cross-tenant access, and no project-level counterpart is needed because
+project-scoped resources are never referenced across project boundaries.
+
 #### Concrete before/after example
 
 **Before (current):** `subnet_type.proto`
@@ -561,7 +642,7 @@ After:
 
 The interceptor is a unary server interceptor registered in the gRPC
 interceptor chain after authentication and transaction management (so that
-tenant context and a database transaction are available).
+tenant and project context and a database transaction are available).
 
 ```go
 // ReferenceValidator validates and resolves resource references in incoming
@@ -598,19 +679,45 @@ func (v *ReferenceValidator) Validate(
 ) error
 ```
 
-**Tenant scope resolution.** For public API full references, the interceptor
-translates `shared = true` to `tenant = "shared"` and `shared = false` (or
-unset) to the caller's tenant from auth context. For private API full
-references, it uses the explicit `tenant` field, falling back to the caller's
-tenant when empty. The lookup function always receives a resolved `tenant`
-string.
+**Scope resolution.** The interceptor determines the tenant and project
+context for each reference lookup based on the reference type and the
+target resource's scope level (see Reference target scope classification):
+
+*Tenant resolution:*
+
+- **Public API full references:** `shared = true` maps to `tenant = "shared"`;
+  `shared = false` (or unset) maps to the caller's tenant from auth context.
+- **Private API full references:** uses the explicit `tenant` field, falling
+  back to the caller's tenant when empty.
+- **Local references:** uses the caller's tenant from auth context.
+
+*Project resolution:*
+
+- **Project-scoped targets (local references only):** The interceptor
+  passes the caller's project from auth context. The lookup function filters
+  by both tenant and project. A user in project A cannot resolve resources
+  that exist only in project B — the lookup returns not-found.
+- **Project-or-tenant targets (templates, catalog items, roles):** The
+  interceptor uses project-first-then-tenant fallback. It first looks up the
+  resource within the caller's project. If not found, it retries with an
+  empty project (tenant-level). A project-scoped instance shadows a
+  tenant-scoped one with the same name.
+- **Platform-scoped targets:** The interceptor passes empty tenant and
+  project strings. The lookup function applies no scope filtering.
+- **Private API full references with explicit project:** When the `project`
+  field is set, the interceptor uses that value directly. When empty, it
+  applies the fallback rules above based on the target's scope level.
+
+The lookup function always receives resolved `tenant` and `project` strings
+(empty string meaning "no filter for this dimension"). The scope level of
+the target resource determines which dimensions are populated.
 
 **Resolution modes.** The interceptor supports three resolution modes for full
 references, determined by which fields the caller provides:
 
 | Mode | Input | Behavior |
 |------|-------|----------|
-| Name only | `name` set, `id` empty | Look up by name within tenant scope. Auto-populate `id` in the request. |
+| Name only | `name` set, `id` empty | Look up by name within the resolved scope (see Scope resolution). Auto-populate `id` in the request. |
 | ID only | `id` set, `name` empty | Look up by id. Auto-populate `name` in the request. |
 | Both | `id` and `name` both set | Look up, verify both resolve to the same resource. Return `InvalidArgument` if they disagree. |
 
@@ -627,7 +734,9 @@ values back into the request message via `protoreflect.Message.Set()`. This
 ensures the handler and stored JSON always contain fully-qualified references
 regardless of how the caller specified them. For example, a client that sends
 `{ "id": "abc-123" }` gets the stored reference expanded to
-`{ "id": "abc-123", "tenant": "my-tenant", "project": "", "name": "my-template" }`.
+`{ "id": "abc-123", "tenant": "my-tenant", "project": "", "name": "my-template" }`
+(project is empty because templates are project-or-tenant scoped and this
+instance was resolved at the tenant level).
 
 **Reference detection.** The interceptor identifies reference fields by
 checking whether a field's message type ends with `Reference` or
@@ -646,12 +755,18 @@ iterates each element. For oneof fields, it inspects the populated variant.
 For nested messages (like `NetworkAttachment` inside `ComputeInstanceSpec`),
 it recurses.
 
-**Tenant context.** For `LocalReference` messages (which have only a `name`
+**Scope context.** For `LocalReference` messages (which have only a `name`
 field), the interceptor extracts tenant and project from the request's
-authentication context. For public full `Reference` messages, `shared = true`
-maps to the `shared` tenant; otherwise the caller's tenant is used. For
-private full `Reference` messages, the explicit `tenant` field is used,
-falling back to the caller's context when empty.
+authentication context. Because all local reference targets are
+project-scoped, the lookup always filters by both tenant and project,
+enforcing project-level isolation: a resource in project A is invisible to
+callers in project B. For public full `Reference` messages, `shared = true`
+maps to the `shared` tenant; otherwise the caller's tenant is used. Project
+resolution depends on the target's scope level: project-or-tenant targets
+use the project-first-then-tenant fallback, while platform-scoped targets
+omit project filtering entirely. For private full `Reference` messages, the
+explicit `tenant` and `project` fields are used, falling back to the
+caller's context when empty.
 
 **Error aggregation.** The interceptor collects all invalid references before
 returning, so the user sees every problem in a single error response. It
@@ -660,9 +775,21 @@ per invalid reference, where the `field` is the proto field path (e.g.,
 `spec.network_attachments[0].subnet.name`) and the `description` is a
 human-readable message.
 
-**Platform-scoped resources.** Resources like NetworkClass, ExternalIPPool,
-PublicIPPool, and HostType are platform-scoped and not filtered by tenant. The
-lookup function registered for these types omits tenant filtering.
+**Scope-aware lookups.** Each registered lookup function applies filtering
+appropriate to its target resource's scope level (see Reference target
+scope classification):
+
+- **Platform-scoped** (NetworkClass, ExternalIPPool, PublicIPPool, HostType,
+  InstanceType): No tenant or project filtering. Names are globally unique.
+- **Project-or-tenant** (templates, catalog items, Role): Project-first-
+  then-tenant fallback. The interceptor issues two lookups if needed: first
+  with the caller's project, then with an empty project (tenant-level).
+- **Project-scoped** (VirtualNetwork, Subnet, SecurityGroup,
+  ComputeInstance, Cluster, BareMetalInstance, ExternalIP, PublicIP, and
+  their attachments): Both tenant and project filtering. A resource in
+  project B is invisible to lookups scoped to project A.
+- **Cross-project** (User, Project, ProjectMembership, RoleBinding): IAM
+  resources use resource-specific scoping rules.
 
 **Interceptor registration in the chain:**
 
@@ -670,7 +797,7 @@ lookup function registered for these types omits tenant filtering.
 Panic Recovery -> Metrics -> Logging -> Protovalidate -> Transaction -> Auth -> Authz -> JIT Provisioning -> Reference Validation -> Handler
 ```
 
-The interceptor runs after Auth (tenant context for scoped lookups) and after
+The interceptor runs after Auth (tenant and project context for scoped lookups) and after
 Transaction (DAO lookups share the request's database transaction). Validation
 failures cause a transaction rollback, which is the desired behavior (no
 partial state changes).
@@ -694,40 +821,44 @@ PL/pgSQL triggers serve two purposes:
 **All triggers require JSON path updates** to reflect the new nested
 reference structure. This is a semantic shift: triggers currently match on
 resource IDs (primary keys), but will switch to matching on resource names
-(unique within a tenant). This aligns with the name-based resolution model
-introduced by this EP.
+(unique within a scope — per-tenant for tenant-scoped resources,
+per-tenant-and-project for project-scoped resources). This aligns with the
+name-based resolution model introduced by this EP.
 
-**Tenant scoping.** Because names are unique per tenant (not globally like
-IDs), trigger queries must add tenant predicates when switching from ID-based
-to name-based matching. The scoping rule depends on the reference type:
+**Scope predicates.** Because names are unique within a scope (not globally
+like IDs), trigger queries must add scope predicates when switching from
+ID-based to name-based matching. The scoping rule depends on the reference
+type:
 
-- **Same-tenant local references** (Subnet→VN, CI→Subnet, SG→VN,
-  CI→InstanceType): Currently match on `id` with no tenant filter. After
-  migration, add `tenant = new.tenant` (forward triggers) or
-  `tenant = old.tenant` (reverse triggers) to scope lookups within the
-  correct tenant.
+- **Project-scoped local references** (Subnet→VN, CI→Subnet, SG→VN,
+  NATGateway→VN, NATGateway→ExternalIP, all IP attachment targets):
+  Currently match on `id` with no tenant or project filter. After
+  migration, add `tenant = new.tenant AND project = new.project` (forward
+  triggers) or `tenant = old.tenant AND project = old.project` (reverse
+  triggers) to scope lookups within the correct tenant and project.
 - **Cross-tenant/shared references** (Cluster→CatalogItem,
   CI→CatalogItem): Already have tenant scoping via
   `(tenant = new.tenant OR tenant = 'shared')`. After migration, drop the
   ID match alternative and update JSON paths to nested `->>'name'`.
-- **Platform-scoped references** (VN→NetworkClass): No triggers exist
-  today. If added, no tenant filter is needed — platform-scoped names are
-  globally unique.
+  No project predicate needed — catalog items are tenant-scoped.
+- **Platform-scoped references** (VN→NetworkClass, CI→InstanceType): No
+  triggers exist today. If added, no tenant or project filter is needed —
+  platform-scoped names are globally unique.
 
-Associated indexes must include `tenant` as a leading column for
-same-tenant triggers to keep queries efficient.
+Associated indexes must include `tenant` and `project` as leading columns
+for project-scoped triggers to keep queries efficient.
 
 Example path changes:
 
-| Trigger function | Table | Path change | Tenant scoping |
+| Trigger function | Table | Path change | Scope predicates |
 |---|---|---|---|
-| `check_virtual_network_not_in_use()` (Z0003) | virtual_networks | `= old.id` → `data->'spec'->'virtual_network'->>'name'` | Add `tenant = old.tenant` |
-| `check_subnet_not_in_use()` (Z0003) | subnets | `->>'subnet'` → `->'subnet'->>'name'` | Add `tenant = old.tenant` |
-| `check_instance_type_not_in_use()` (Z0003) | instance_types | `->>'instance_type'` → `->'instance_type'->>'name'` | Add `tenant = old.tenant` |
-| `check_subnet_virtual_network_ref()` (Z0002) | subnets | `id = vn_id` → `name = vn_name` | Add `tenant = new.tenant` |
-| `check_compute_instance_subnet_refs()` (Z0002) | compute_instances | `id = subnet_id` → `name = subnet_name` | Add `tenant = new.tenant` |
-| `check_cluster_catalog_item_ref()` (Z0002) | clusters | Drop `id =` alternative | Already scoped |
-| `check_ci_catalog_item_ref()` (Z0002) | compute_instances | Drop `id =` alternative | Already scoped |
+| `check_virtual_network_not_in_use()` (Z0003) | virtual_networks | `= old.id` → `data->'spec'->'virtual_network'->>'name'` | Add `tenant = old.tenant AND project = old.project` |
+| `check_subnet_not_in_use()` (Z0003) | subnets | `->>'subnet'` → `->'subnet'->>'name'` | Add `tenant = old.tenant AND project = old.project` |
+| `check_instance_type_not_in_use()` (Z0003) | instance_types | `->>'instance_type'` → `->'instance_type'->>'name'` | None (platform-scoped) |
+| `check_subnet_virtual_network_ref()` (Z0002) | subnets | `id = vn_id` → `name = vn_name` | Add `tenant = new.tenant AND project = new.project` |
+| `check_compute_instance_subnet_refs()` (Z0002) | compute_instances | `id = subnet_id` → `name = subnet_name` | Add `tenant = new.tenant AND project = new.project` |
+| `check_cluster_catalog_item_ref()` (Z0002) | clusters | Drop `id =` alternative | Already scoped (tenant) |
+| `check_ci_catalog_item_ref()` (Z0002) | compute_instances | Drop `id =` alternative | Already scoped (tenant) |
 
 #### CEL Filter Expression Changes
 
@@ -853,11 +984,23 @@ rejects malformed input. The interceptor validates that names are non-empty
 and match existing resources. No SQL injection risk exists because lookups
 use parameterized DAO queries, not string concatenation.
 
-**Cross-tenant information disclosure:** When a user provides a full reference
-with an explicit tenant, the interceptor's error message reveals whether the
-referenced resource exists in that tenant. This is the same behavior as the
-current system (servers return "not found" for nonexistent references). The
-existing OPA policies already gate cross-tenant visibility.
+**Cross-tenant information disclosure:** On the private API, when a Cloud
+Provider Admin provides a full reference with an explicit tenant, the error
+message includes the target tenant and project (the admin provided them).
+On the public API, full references use `bool shared` — the interceptor
+translates this internally and never exposes the resolved tenant name in
+error messages. Public API errors include only the resource type and name
+(e.g., `VirtualNetwork "foo" not found`), preventing callers from learning
+about tenants outside their own scope.
+
+**Cross-project information disclosure:** For project-scoped resources, the
+interceptor filters lookups by the caller's project (extracted from auth
+context). A resource in project B is indistinguishable from a nonexistent
+resource when queried from project A — the lookup returns not-found in both
+cases. Error messages for public API callers do not include the project
+name, preventing callers from probing for resources in other projects. This
+is enforced at the interceptor level, independent of the upstream
+authorization layer, providing defense-in-depth for project isolation.
 
 ### Failure Handling and Recovery
 
@@ -887,10 +1030,36 @@ validator.
 ### RBAC / Tenancy
 
 No RBAC or tenancy changes are required. The reference validation interceptor
-reuses the existing tenant context from the authentication interceptor. Local
-reference lookups are automatically scoped to the caller's tenant and project.
-Full reference lookups with explicit tenant/project are subject to existing
-OPA cross-tenant access policies.
+reuses the existing tenant and project context from the authentication
+interceptor.
+
+**Private API restriction.** The private API is accessible only to Cloud
+Provider Admins. Private API reference messages expose explicit `tenant` and
+`project` fields that enable cross-tenant and cross-project lookups. Tenant
+Admins and Tenant Users never interact with the private API and cannot
+specify arbitrary tenant or project values.
+
+**Project-scoped isolation.** Local reference lookups are automatically
+scoped to the caller's tenant and project. For project-scoped resources
+(networking, compute, IP management), the interceptor includes the caller's
+project as a lookup predicate. This prevents a user in project A from
+resolving references to resources in project B, even when both projects
+are within the same tenant.
+
+**Project-or-tenant resources.** Full reference lookups for project-or-tenant
+resources (templates, catalog items, roles) use project-first-then-tenant
+fallback. The interceptor first searches the caller's project, then falls
+back to the tenant level if the resource is not found. This allows both
+project-scoped and tenant-scoped instances of these resource types to
+coexist.
+
+**Platform-scoped resources.** Full reference lookups for platform-scoped
+resources (NetworkClass, ExternalIPPool, PublicIPPool, HostType,
+InstanceType) apply no tenant or project filter. These resources are
+visible to all tenants.
+
+Full reference lookups with explicit tenant/project (private API only) are
+subject to existing OPA cross-tenant access policies.
 
 This enhancement does not introduce new resources, so no new tenant isolation
 metadata (`osac.openshift.io/tenant`, `osac.openshift.io/owner-reference`)
@@ -1005,6 +1174,18 @@ details on the URI/ARN trade-off.
 - Per-server validation removal: verify that servers no longer perform inline
   existence checks for fields handled by the interceptor, but continue to
   perform business logic validation.
+- Project-scoped lookup isolation: verify that the interceptor passes the
+  caller's project to the lookup function for project-scoped targets (local
+  references) and that lookups scoped to project A do not return resources
+  in project B.
+- Project-or-tenant fallback: verify that for project-or-tenant targets
+  (templates, catalog items, roles), the interceptor first searches the
+  caller's project, then falls back to tenant-level when not found in the
+  project. Verify that a project-scoped instance shadows a tenant-scoped
+  instance with the same name.
+- Error message format by API type: verify that public API error messages
+  omit tenant and project identifiers, while private API error messages
+  include them.
 
 **Integration tests (kind cluster):**
 
@@ -1039,6 +1220,31 @@ details on the URI/ARN trade-off.
 - Both-mismatch resolution (Chunk 1): Create a Subnet providing `id` of one
   VirtualNetwork and `name` of another. Verify `InvalidArgument` with a
   message explaining the inconsistency.
+- Cross-project isolation — local reference (Chunk 1): Create a
+  VirtualNetwork "prod-net" in project A. Switch to project B and attempt
+  to create a Subnet referencing VirtualNetwork "prod-net". Verify
+  `InvalidArgument` — the VirtualNetwork is not visible from project B.
+- Cross-project isolation — compute (Chunk 2): Create a Subnet
+  "app-subnet" in project A. In project B, attempt to create a
+  ComputeInstance with a network attachment referencing "app-subnet".
+  Verify `InvalidArgument`.
+- Project-or-tenant fallback (Chunk 2): Create a tenant-scoped
+  ComputeInstanceCatalogItem "standard-vm" (no project). In project A,
+  create a ComputeInstance referencing catalog item "standard-vm" via
+  `shared = false`. Verify the full reference resolves successfully via
+  tenant-level fallback.
+- Project-or-tenant shadowing (Chunk 2): Create a tenant-scoped catalog
+  item "standard-vm" and a project-scoped catalog item "standard-vm" in
+  project A. From project A, reference "standard-vm" — verify the
+  project-scoped instance is resolved (shadows the tenant-scoped one).
+- Cross-project error message (Chunk 1): Create a VirtualNetwork
+  "secret-net" in project A. From project B via the public API, attempt to
+  create a Subnet referencing "secret-net". Verify the error message says
+  `VirtualNetwork "secret-net" not found` without mentioning project A.
+- Private API cross-project access (Chunk 1): As Cloud Provider Admin via
+  the private API, create a Subnet in tenant T, project A, referencing a
+  VirtualNetwork in tenant T, project B by explicit `project` field.
+  Verify the reference resolves across projects.
 
 **E2E tests (osac-test-infra, pytest):**
 
